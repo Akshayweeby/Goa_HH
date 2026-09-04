@@ -8,9 +8,11 @@ logic.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
+import cv2
 from dotenv import load_dotenv
 
 from face_detection.detector import FaceDetector
@@ -46,41 +48,75 @@ def run_pipeline(
         return _failed_pipeline("face_detection", face_result.get("error", "Face detection failed"), face=face_result)
 
     search_engine = search_engine or SocialMediaSearchEngine(face_detector=detector)
-    search_result = search_engine.find_posts(
-        image_path=image_path,
-        image_url=public_image_url,
-        face_embedding=face_result["embedding"],
-    )
-    if not search_result.get("success") or not search_result.get("matches"):
-        return _failed_pipeline("social_search", search_result.get("error", "No verified social/web match found"),
-                                face=face_result, search=search_result)
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    people = []
+    source_faces = face_result.get("faces") or [{
+        **face_result["bounding_box"], "embedding": face_result["embedding"]
+    }]
+    for index, face in enumerate(source_faces, start=1):
+        crop_path = None
+        try:
+            x, y = face["x"], face["y"]
+            query_path = image_path
+            if image is not None:
+                crop = image[y:y + face["height"], x:x + face["width"]]
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+                    crop_path = Path(handle.name)
+                cv2.imwrite(str(crop_path), crop)
+                query_path = crop_path
+            search_result = search_engine.find_posts(
+                image_path=query_path,
+                image_url=public_image_url if len(source_faces) == 1 else None,
+                face_embedding=face["embedding"],
+            )
+        finally:
+            if crop_path:
+                crop_path.unlink(missing_ok=True)
 
-    best_match = search_result["matches"][0]
-    uploader = uploader or BlockchainUploader(
-        rpc_url=os.getenv("RPC_URL"),
-        private_key=os.getenv("PRIVATE_KEY"),
-        contract_address=os.getenv("CONTRACT_ADDRESS"),
-    )
-    upload_result = uploader.upload_post(best_match)
-    if not upload_result.get("success") or upload_result.get("post_id") is None:
-        return _failed_pipeline("blockchain_upload", upload_result.get("error", "Blockchain upload failed"),
-                                face=face_result, search=search_result, best_match=best_match,
-                                blockchain_upload=upload_result)
+        person = {"face_number": index, "bounding_box": {
+            key: face[key] for key in ("x", "y", "width", "height")
+        }, "search": search_result, "name": "Not found", "social_media_handle": "Not found",
+                  "post_url": None, "match_confidence": 0.0}
+        if search_result.get("matches"):
+            best_match = search_result["matches"][0]
+            user = best_match.get("user") or {}
+            person.update({
+                "name": user.get("name") or "Not found",
+                "social_media_handle": user.get("handle") or "Not found",
+                "post_url": best_match.get("url"),
+                "match_confidence": best_match.get("match_confidence", 0.0),
+                "best_match": best_match,
+            })
+            if uploader is None:
+                uploader = BlockchainUploader(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
+                                               contract_address=os.getenv("CONTRACT_ADDRESS"))
+            upload_result = uploader.upload_post(best_match)
+            person["blockchain_upload"] = upload_result
+            if upload_result.get("success") and upload_result.get("post_id") is not None:
+                if verifier is None:
+                    verifier = BlockchainVerifier(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
+                                                  contract_address=upload_result.get("contract_address") or os.getenv("CONTRACT_ADDRESS"))
+                person["blockchain_verification"] = verifier.verify_post(best_match, upload_result["post_id"])
+        people.append(person)
 
-    verifier = verifier or BlockchainVerifier(
-        rpc_url=os.getenv("RPC_URL"),
-        private_key=os.getenv("PRIVATE_KEY"),
-        contract_address=upload_result.get("contract_address") or os.getenv("CONTRACT_ADDRESS"),
-    )
-    verification = verifier.verify_post(best_match, upload_result["post_id"])
-    return {
-        "success": bool(verification.get("success") and verification.get("verified")),
+    successful_matches = [person for person in people if person.get("best_match")]
+    result = {
+        "success": bool(successful_matches and all(person.get("blockchain_verification", {}).get("verified", False)
+                                                    for person in successful_matches)),
         "face": face_result,
-        "search": search_result,
-        "best_match": best_match,
-        "blockchain_upload": upload_result,
-        "blockchain_verification": verification,
+        "people": people,
     }
+    if len(successful_matches) == 1:
+        person = successful_matches[0]
+        result.update({"best_match": person["best_match"],
+                       "search": person["search"],
+                       "blockchain_upload": person.get("blockchain_upload"),
+                       "blockchain_verification": person.get("blockchain_verification")})
+    if not successful_matches:
+        result.update({"failed_stage": "social_search", "error": "No verified social/web match found"})
+    elif not result["success"]:
+        result.update({"failed_stage": "blockchain_verification", "error": "One or more matched posts were not verified on-chain"})
+    return result
 
 
 # Name used by the project plan and convenient for CLI callers.
@@ -95,16 +131,14 @@ def print_terminal_result(result: dict[str, Any]) -> None:
         print(f"Face confidence: {face.get('confidence', 0):.4f}")
         print(f"Bounding box: {face.get('bounding_box')}")
         print(f"Embedding dimension: {face.get('embedding_dimension')}")
-    if result.get("best_match"):
-        match = result["best_match"]
-        person_name = (match.get("user") or {}).get("name") or "Not provided by search provider"
-        print(f"Name: {person_name}")
-        print(f"Social/web post: {match.get('url')}")
-        print(f"Match confidence: {match.get('match_confidence', 0):.4f}")
-    if result.get("blockchain_verification"):
-        verification = result["blockchain_verification"]
-        print(f"Blockchain verified: {verification.get('verified', False)}")
-        print(f"Verification transaction: {verification.get('transaction_hash')}")
+    for person in result.get("people", []):
+        print(f"\nPerson {person['face_number']}")
+        print(f"  Name: {person['name']}")
+        print(f"  Social media handle: {person['social_media_handle']}")
+        print(f"  Post: {person['post_url'] or 'Not found'}")
+        print(f"  Match confidence: {person['match_confidence']:.4f}")
+        if person.get("blockchain_verification"):
+            print(f"  Blockchain verified: {person['blockchain_verification'].get('verified', False)}")
     if not result.get("success"):
         print(f"Pipeline stopped at {result.get('failed_stage')}: {result.get('error')}")
     print("\nFull result JSON:")
@@ -117,7 +151,16 @@ if __name__ == "__main__":
     import json
 
     parser = argparse.ArgumentParser(description="Run the Goa face-to-blockchain pipeline")
-    parser.add_argument("image_path", nargs="?", default="Images/images.jpg", help="Input JPG/PNG image (default: Images/images.jpg)")
+    parser.add_argument("image_path", nargs="?", default=None, help="Input JPG/PNG image")
+    parser.add_argument("--interactive", action="store_true", help="Prompt for Search <image-name>")
     parser.add_argument("--public-image-url", help="Public image URL for Google Lens")
     args = parser.parse_args()
+    if args.interactive or not args.image_path:
+        command = input("Type 'Search <image-name>' or 'Exit': ").strip()
+        parts = command.split(maxsplit=1)
+        if not parts or parts[0].lower() == "exit":
+            raise SystemExit(0)
+        if parts[0].lower() != "search" or len(parts) != 2:
+            raise SystemExit("Use: Search images.jpg")
+        args.image_path = str(Path("Images") / parts[1])
     print_terminal_result(run_pipeline(args.image_path, args.public_image_url))
