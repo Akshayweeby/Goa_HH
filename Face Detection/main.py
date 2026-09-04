@@ -60,10 +60,13 @@ def run_pipeline(
             query_path = image_path
             if image is not None:
                 crop = image[y:y + face["height"], x:x + face["width"]]
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
-                    crop_path = Path(handle.name)
-                cv2.imwrite(str(crop_path), crop)
-                query_path = crop_path
+                # Full-image discovery works better for a single portrait;
+                # crops remain useful when the image contains several faces.
+                if len(source_faces) > 1:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+                        crop_path = Path(handle.name)
+                    cv2.imwrite(str(crop_path), crop)
+                    query_path = crop_path
             search_result = search_engine.find_posts(
                 image_path=query_path,
                 image_url=public_image_url if len(source_faces) == 1 else None,
@@ -76,7 +79,9 @@ def run_pipeline(
         person = {"face_number": index, "bounding_box": {
             key: face[key] for key in ("x", "y", "width", "height")
         }, "search": search_result, "name": "Not found", "social_media_handle": "Not found",
-                  "post_url": None, "match_confidence": 0.0}
+                  "post_url": None, "match_confidence": 0.0,
+                  "search_method": search_result.get("search_method"),
+                  "search_error": search_result.get("error")}
         if search_result.get("matches"):
             best_match = search_result["matches"][0]
             user = best_match.get("user") or {}
@@ -137,6 +142,10 @@ def print_terminal_result(result: dict[str, Any]) -> None:
         print(f"  Social media handle: {person['social_media_handle']}")
         print(f"  Post: {person['post_url'] or 'Not found'}")
         print(f"  Match confidence: {person['match_confidence']:.4f}")
+        if person.get("search_method"):
+            print(f"  Search method: {person['search_method']}")
+        if person.get("search_error"):
+            print(f"  Search status: {person['search_error']}")
         if person.get("blockchain_verification"):
             print(f"  Blockchain verified: {person['blockchain_verification'].get('verified', False)}")
     if not result.get("success"):
