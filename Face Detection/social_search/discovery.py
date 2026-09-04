@@ -100,13 +100,28 @@ class SerpApiGoogleLens:
 
     @staticmethod
     def _parse(payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return [
+        candidates = [
             {
                 "url": item.get("link"),
                 "image_url": item.get("image") or item.get("thumbnail"),
                 "title": item.get("title", ""),
+                "person_name": item.get("title", ""),
                 "source": "google_lens_serpapi",
             }
             for item in payload.get("visual_matches", [])
             if item.get("link") and (item.get("image") or item.get("thumbnail"))
         ]
+        knowledge_graph = payload.get("knowledge_graph", [])
+        if isinstance(knowledge_graph, dict):
+            knowledge_graph = [knowledge_graph]
+        for item in knowledge_graph:
+            if item.get("title") and item.get("link"):
+                candidates.append({
+                    "url": item["link"],
+                    "image_url": item.get("image") or item.get("thumbnail"),
+                    "title": item.get("description", ""),
+                    "person_name": item["title"],
+                    "source": "google_lens_knowledge_graph",
+                    "unverified": True,
+                })
+        return candidates

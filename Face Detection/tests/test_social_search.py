@@ -26,6 +26,14 @@ def test_lens_parser_ignores_incomplete_results():
     assert len(result) == 1
 
 
+def test_lens_parser_keeps_knowledge_graph_entity():
+    result = SerpApiGoogleLens._parse({"knowledge_graph": {
+        "title": "Example Person", "link": "https://example.test/person"
+    }})
+    assert result[0]["person_name"] == "Example Person"
+    assert result[0]["unverified"] is True
+
+
 def test_real_provider_candidates_are_ranked_and_limited(monkeypatch):
     engine = SocialMediaSearchEngine(face_detector=FakeDetector(), bing_api_key="key", max_candidates=5)
     candidates = [

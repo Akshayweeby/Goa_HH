@@ -7,6 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -80,6 +81,8 @@ class SocialMediaSearchEngine:
     def _rank(self, candidates: Iterable[dict[str, Any]], embedding: list[float]) -> list[dict[str, Any]]:
         ranked = []
         for candidate in list(candidates)[: self.max_candidates]:
+            if not candidate.get("image_url"):
+                continue
             encoded = self._download_and_encode(candidate["image_url"])
             if not encoded:
                 continue
@@ -92,11 +95,46 @@ class SocialMediaSearchEngine:
                 "user": {"handle": None, "name": None},
                 "match_confidence": round(similarity, 6),
                 "face_confidence": encoded["confidence"],
+                "verified_match": True,
+                "person_name": candidate.get("person_name"),
+                "source": candidate.get("source"),
             })
         ranked.sort(key=lambda item: item["match_confidence"], reverse=True)
         for rank, item in enumerate(ranked[:3], start=1):
             item["rank"] = rank
         return ranked[:3]
+
+    @staticmethod
+    def _unverified_entities(candidates: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Expose provider entity results when no image could be verified."""
+        entities = []
+        seen = set()
+        for candidate in candidates:
+            name, url = candidate.get("person_name"), candidate.get("url")
+            if not candidate.get("unverified") or not name or not url or url in seen:
+                continue
+            seen.add(url)
+            host = urlparse(url).netloc.lower()
+            handle = None
+            if any(site in host for site in ("instagram.com", "x.com", "twitter.com", "facebook.com")):
+                parts = [part for part in urlparse(url).path.split("/") if part]
+                handle = ("@" + parts[0].lstrip("@")) if parts else None
+            entities.append({
+                "rank": len(entities) + 1,
+                "url": url,
+                "image_url": candidate.get("image_url"),
+                "caption": candidate.get("title", ""),
+                "timestamp": None,
+                "user": {"handle": handle, "name": name},
+                "match_confidence": 0.0,
+                "face_confidence": 0.0,
+                "verified_match": False,
+                "verification_status": "unverified_provider_entity",
+                "source": candidate.get("source"),
+            })
+            if len(entities) == 3:
+                break
+        return entities
 
     def find_posts(
         self,
@@ -138,4 +176,6 @@ class SocialMediaSearchEngine:
         if not method_parts and mock_candidates is None:
             return self._result(start, [], "none", "Configure BING_VISUAL_SEARCH_KEY or SERPAPI_KEY and provide the required image input")
         matches = self._rank(candidates, face_embedding)
+        if not matches:
+            matches = self._unverified_entities(candidates)
         return self._result(start, matches, "+".join(method_parts) or "mock", None if matches else "No provider candidate could be verified locally")

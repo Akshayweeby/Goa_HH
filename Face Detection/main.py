@@ -92,19 +92,22 @@ def run_pipeline(
                 "match_confidence": best_match.get("match_confidence", 0.0),
                 "best_match": best_match,
             })
-            if uploader is None:
+            person["match_status"] = "Verified match" if best_match.get("verified_match", True) else "Likely match (not verified)"
+            if best_match.get("verified_match", True) and uploader is None:
                 uploader = BlockchainUploader(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
                                                contract_address=os.getenv("CONTRACT_ADDRESS"))
-            upload_result = uploader.upload_post(best_match)
-            person["blockchain_upload"] = upload_result
-            if upload_result.get("success") and upload_result.get("post_id") is not None:
-                if verifier is None:
-                    verifier = BlockchainVerifier(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
-                                                  contract_address=upload_result.get("contract_address") or os.getenv("CONTRACT_ADDRESS"))
-                person["blockchain_verification"] = verifier.verify_post(best_match, upload_result["post_id"])
+            if best_match.get("verified_match", True):
+                upload_result = uploader.upload_post(best_match)
+                person["blockchain_upload"] = upload_result
+                if upload_result.get("success") and upload_result.get("post_id") is not None:
+                    if verifier is None:
+                        verifier = BlockchainVerifier(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
+                                                      contract_address=upload_result.get("contract_address") or os.getenv("CONTRACT_ADDRESS"))
+                    person["blockchain_verification"] = verifier.verify_post(best_match, upload_result["post_id"])
         people.append(person)
 
-    successful_matches = [person for person in people if person.get("best_match")]
+    successful_matches = [person for person in people
+                          if person.get("best_match") and person["best_match"].get("verified_match", True)]
     result = {
         "success": bool(successful_matches and all(person.get("blockchain_verification", {}).get("verified", False)
                                                     for person in successful_matches)),
@@ -142,6 +145,7 @@ def print_terminal_result(result: dict[str, Any]) -> None:
         print(f"  Social media handle: {person['social_media_handle']}")
         print(f"  Post: {person['post_url'] or 'Not found'}")
         print(f"  Match confidence: {person['match_confidence']:.4f}")
+        print(f"  Match status: {person.get('match_status', 'Not found')}")
         if person.get("search_method"):
             print(f"  Search method: {person['search_method']}")
         if person.get("search_error"):
