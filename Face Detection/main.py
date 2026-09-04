@@ -8,9 +8,12 @@ logic.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 import cv2
 from dotenv import load_dotenv
@@ -94,16 +97,20 @@ def run_pipeline(
             })
             person["match_status"] = "Verified match" if best_match.get("verified_match", True) else "Likely match (not verified)"
             if best_match.get("verified_match", True) and uploader is None:
-                uploader = BlockchainUploader(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
-                                               contract_address=os.getenv("CONTRACT_ADDRESS"))
+                try:
+                    uploader = BlockchainUploader(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
+                                                   contract_address=os.getenv("CONTRACT_ADDRESS"))
+                except (ImportError, ValueError) as exc:
+                    person["blockchain_upload"] = {"success": False, "status": "not_configured", "error": str(exc)}
             if best_match.get("verified_match", True):
-                upload_result = uploader.upload_post(best_match)
-                person["blockchain_upload"] = upload_result
-                if upload_result.get("success") and upload_result.get("post_id") is not None:
-                    if verifier is None:
-                        verifier = BlockchainVerifier(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
-                                                      contract_address=upload_result.get("contract_address") or os.getenv("CONTRACT_ADDRESS"))
-                    person["blockchain_verification"] = verifier.verify_post(best_match, upload_result["post_id"])
+                if uploader is not None:
+                    upload_result = uploader.upload_post(best_match)
+                    person["blockchain_upload"] = upload_result
+                    if upload_result.get("success") and upload_result.get("post_id") is not None:
+                        if verifier is None:
+                            verifier = BlockchainVerifier(rpc_url=os.getenv("RPC_URL"), private_key=os.getenv("PRIVATE_KEY"),
+                                                          contract_address=upload_result.get("contract_address") or os.getenv("CONTRACT_ADDRESS"))
+                        person["blockchain_verification"] = verifier.verify_post(best_match, upload_result["post_id"])
         people.append(person)
 
     successful_matches = [person for person in people
@@ -131,18 +138,21 @@ def run_pipeline(
 run_full_pipeline = run_pipeline
 
 
-def print_terminal_result(result: dict[str, Any]) -> None:
-    """Print the useful human-readable fields without hiding the JSON result."""
+def print_terminal_result(result: dict[str, Any], verbose: bool = False) -> None:
+    """Print a concise report; use verbose for the full diagnostic JSON."""
     if result.get("face"):
         face = result["face"]
         print(f"Face detected: {face.get('faces_detected', 0)}")
         print(f"Face confidence: {face.get('confidence', 0):.4f}")
-        print(f"Bounding box: {face.get('bounding_box')}")
-        print(f"Embedding dimension: {face.get('embedding_dimension')}")
     for person in result.get("people", []):
         print(f"\nPerson {person['face_number']}")
         print(f"  Name: {person['name']}")
-        print(f"  Social media handle: {person['social_media_handle']}")
+        handle = person['social_media_handle']
+        if handle == "Not found" and person.get("best_match"):
+            title = person["best_match"].get("caption", "")
+            found = re.search(r"@[A-Za-z0-9_.-]+", title)
+            handle = found.group(0) if found else handle
+        print(f"  Social media handle: {handle}")
         print(f"  Post: {person['post_url'] or 'Not found'}")
         print(f"  Match confidence: {person['match_confidence']:.4f}")
         print(f"  Match status: {person.get('match_status', 'Not found')}")
@@ -150,13 +160,16 @@ def print_terminal_result(result: dict[str, Any]) -> None:
             print(f"  Search method: {person['search_method']}")
         if person.get("search_error"):
             print(f"  Search status: {person['search_error']}")
+        if person.get("blockchain_upload", {}).get("status") == "not_configured":
+            print("  Blockchain: Not configured (add PRIVATE_KEY and CONTRACT_ADDRESS to .env)")
         if person.get("blockchain_verification"):
             print(f"  Blockchain verified: {person['blockchain_verification'].get('verified', False)}")
     if not result.get("success"):
         print(f"Pipeline stopped at {result.get('failed_stage')}: {result.get('error')}")
-    print("\nFull result JSON:")
-    import json
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if verbose:
+        print("\nFull result JSON:")
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -167,6 +180,7 @@ if __name__ == "__main__":
     parser.add_argument("image_path", nargs="?", default=None, help="Input JPG/PNG image")
     parser.add_argument("--interactive", action="store_true", help="Prompt for Search <image-name>")
     parser.add_argument("--public-image-url", help="Public image URL for Google Lens")
+    parser.add_argument("--verbose", action="store_true", help="Print the full embedding and JSON result")
     args = parser.parse_args()
     if args.interactive or not args.image_path:
         command = input("Type 'Search <image-name>' or 'Exit': ").strip()
@@ -176,4 +190,4 @@ if __name__ == "__main__":
         if parts[0].lower() != "search" or len(parts) != 2:
             raise SystemExit("Use: Search images.jpg")
         args.image_path = str(Path("Images") / parts[1])
-    print_terminal_result(run_pipeline(args.image_path, args.public_image_url))
+    print_terminal_result(run_pipeline(args.image_path, args.public_image_url), verbose=args.verbose)
